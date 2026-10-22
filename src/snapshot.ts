@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -17,18 +17,20 @@ import {
 	getRepoSnapshotPath,
 	looksLikeCommitSha,
 	pathExists,
+	readJsonFile,
 	readRepoMetadataCache,
 	readRepoRefCache,
 	readRepoTreeCache,
+	writeJsonFile,
 	writeRepoTreeCache,
 } from "./store.ts";
 import type { CachedRepoState, GitHubRepo, GitHubTreeEntry, GitHubTreeResponse, RepoSnapshot } from "./types.ts";
 
 const execFileAsync = promisify(execFile);
 const repoSnapshotCache = new Map<string, Promise<RepoSnapshot>>();
-const SNAPSHOT_LOCK_TIMEOUT_MS = 10_000;
-const SNAPSHOT_LOCK_STALE_MS = 30_000;
-const SNAPSHOT_LOCK_POLL_MS = 25;
+const SNAPSHOT_POINTER_SUFFIX = ".snapshot.json";
+const SNAPSHOT_GENERATION_INFIX = ".snapshot-";
+const SNAPSHOT_GENERATION_SUFFIX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export async function getCachedRepoState(repo: GitHubRepo, ref?: string, signal?: AbortSignal): Promise<CachedRepoState | null> {
 	signal?.throwIfAborted();
@@ -37,8 +39,9 @@ export async function getCachedRepoState(repo: GitHubRepo, ref?: string, signal?
 	const refCache = looksLikeCommitSha(requestedRef) ? null : await readRepoRefCache(repo, requestedRef);
 	const commit = looksLikeCommitSha(requestedRef) ? requestedRef : refCache?.commit;
 	if (!commit) return null;
-	const snapshotPath = getRepoSnapshotPath(repo, commit);
-	if (!(await pathExists(join(snapshotPath, REPO_CACHE_COMPLETE_MARKER)))) return null;
+	const cachePath = getRepoSnapshotPath(repo, commit);
+	const snapshotPath = await findCompleteSnapshotPath(commit, cachePath);
+	if (!snapshotPath) return null;
 	const tree = await getOrCreateSnapshotTree(repo, commit, snapshotPath, signal);
 	return {
 		ref: requestedRef,
@@ -153,9 +156,8 @@ export async function generateSnapshotTree(snapshotPath: string, signal?: AbortS
 
 export async function createRepoSnapshot(repo: GitHubRepo, commitSha: string, signal?: AbortSignal): Promise<RepoSnapshot> {
 	const cachePath = getRepoSnapshotPath(repo, commitSha);
-	if (await isCompleteSnapshot(cachePath)) {
-		return { path: cachePath, commit: commitSha };
-	}
+	const publishedPath = await findCompleteSnapshotPath(commitSha, cachePath);
+	if (publishedPath) return { path: publishedPath, commit: commitSha };
 	await mkdir(dirname(cachePath), { recursive: true });
 	const tempDir = await mkdtemp(join(dirname(cachePath), `.tmp-${commitSha}-`));
 	const archivePath = join(tempDir, "repo.tar.gz");
@@ -165,8 +167,7 @@ export async function createRepoSnapshot(repo: GitHubRepo, commitSha: string, si
 		await downloadRepoArchive(repo, commitSha, archivePath, signal);
 		await execFileAsync("tar", ["-xzf", archivePath, "-C", extractPath, "--strip-components=1"]);
 		await writeCompleteMarker(extractPath, commitSha);
-		await publishSnapshot(extractPath, cachePath, signal);
-		const snapshot = { path: cachePath, commit: commitSha };
+		const snapshot = await publishSnapshot(commitSha, extractPath, cachePath);
 		await getOrCreateSnapshotTree(repo, commitSha, snapshot.path).catch(() => undefined);
 		return snapshot;
 	} finally {
@@ -186,49 +187,37 @@ async function writeCompleteMarker(extractPath: string, commitSha: string): Prom
 	await writeFile(markerPath, commitSha, { encoding: "utf8", flag: "wx" });
 }
 
-// Publication and abandoned-directory recovery are serialized across processes by a lock file
-// beside the snapshot. Under the lock the destination is either already complete (reuse it) or
-// incomplete (delete it in place), so a published snapshot is never relocated or removed.
-async function publishSnapshot(extractPath: string, cachePath: string, signal?: AbortSignal): Promise<void> {
-	const lockPath = `${cachePath}.lock`;
-	await acquireSnapshotLock(lockPath, signal);
-	try {
-		if (await isCompleteSnapshot(cachePath)) return;
-		await rm(cachePath, { recursive: true, force: true });
-		await rename(extractPath, cachePath);
-	} finally {
-		await rm(lockPath, { force: true });
-	}
+// Publication only renames a completed extraction into a fresh sibling generation; the shared
+// cachePath is never moved or removed, so every returned snapshot stays readable.
+async function publishSnapshot(commitSha: string, extractPath: string, cachePath: string): Promise<RepoSnapshot> {
+	const generation = `${commitSha}${SNAPSHOT_GENERATION_INFIX}${randomUUID()}`;
+	await rename(extractPath, join(dirname(cachePath), generation));
+	await writeJsonFile(getSnapshotPointerPath(cachePath), { generation });
+	const publishedPath = await findCompleteSnapshotPath(commitSha, cachePath);
+	if (!publishedPath) throw new Error(`Snapshot publication left no readable generation: ${cachePath}`);
+	return { path: publishedPath, commit: commitSha };
 }
 
-// A holder that dies leaves its lock behind; a lock older than the stale threshold is taken over,
-// so an interrupted creator cannot permanently poison the cache.
-async function acquireSnapshotLock(lockPath: string, signal?: AbortSignal): Promise<void> {
-	const deadline = Date.now() + SNAPSHOT_LOCK_TIMEOUT_MS;
-	for (;;) {
-		signal?.throwIfAborted();
-		try {
-			await writeFile(lockPath, String(process.pid), { encoding: "utf8", flag: "wx" });
-			return;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-		}
-		if (await isStaleSnapshotLock(lockPath)) {
-			await rm(lockPath, { force: true });
-			continue;
-		}
-		if (Date.now() >= deadline) throw new Error(`Timed out waiting for the snapshot publication lock: ${lockPath}`);
-		await delay(SNAPSHOT_LOCK_POLL_MS, undefined, { signal });
+// The pointer names one sibling generation directory. Accept only a complete generation whose
+// name belongs to this commit and cache parent, then fall back to the pre-pointer cachePath.
+async function findCompleteSnapshotPath(commitSha: string, cachePath: string): Promise<string | null> {
+	const pointer = await readJsonFile<{ generation?: unknown }>(getSnapshotPointerPath(cachePath));
+	const generation = pointer?.generation;
+	if (isSnapshotGenerationFor(commitSha, generation)) {
+		const generationPath = join(dirname(cachePath), generation);
+		if (await isCompleteSnapshot(generationPath)) return generationPath;
 	}
+	return (await isCompleteSnapshot(cachePath)) ? cachePath : null;
 }
 
-async function isStaleSnapshotLock(lockPath: string): Promise<boolean> {
-	try {
-		const stats = await stat(lockPath);
-		return Date.now() - stats.mtimeMs > SNAPSHOT_LOCK_STALE_MS;
-	} catch {
-		return false;
-	}
+function getSnapshotPointerPath(cachePath: string): string {
+	return `${cachePath}${SNAPSHOT_POINTER_SUFFIX}`;
+}
+
+function isSnapshotGenerationFor(commitSha: string, generation: unknown): generation is string {
+	if (typeof generation !== "string" || /[\\/]/.test(generation)) return false;
+	const prefix = `${commitSha}${SNAPSHOT_GENERATION_INFIX}`;
+	return generation.startsWith(prefix) && SNAPSHOT_GENERATION_SUFFIX.test(generation.slice(prefix.length));
 }
 
 export async function downloadRepoArchive(repo: GitHubRepo, ref: string, archivePath: string, signal?: AbortSignal): Promise<void> {
