@@ -204,6 +204,19 @@ async function selectScannableTargets(cwd: string, targets: string[], signal?: A
 	return scannableTargets;
 }
 
+async function readScannableSnapshotTextFile(snapshotPath: string, filePath: string, signal?: AbortSignal): Promise<string | null> {
+	throwIfAborted(signal);
+	try {
+		// Awaited so the check keeps working when resolveSnapshotPath becomes async.
+		const stats = await lstat(await resolveSnapshotPath(snapshotPath, filePath));
+		if (!stats.isFile()) return null;
+		return await readSnapshotTextFile(snapshotPath, filePath);
+	} catch {
+		// Skip missing, dangling, symlinked, or escaping entries; one bad entry must not abort the scan.
+		return null;
+	}
+}
+
 export function createRipgrepMatchCollector(
 	filesToScanSet: Set<string>,
 	limit: number,
@@ -319,7 +332,7 @@ export async function grepSnapshotWithJavaScript(
 	let matchLimitReached = false;
 	for (const filePath of filesToScan) {
 		throwIfAborted(signal);
-		const fileText = await readSnapshotTextFile(snapshot.path, filePath);
+		const fileText = await readScannableSnapshotTextFile(snapshot.path, filePath, signal);
 		if (fileText === null || looksBinary(fileText)) continue;
 		const lines = normalizeNewlines(fileText).split("\n");
 		for (let index = 0; index < lines.length; index++) {
@@ -352,7 +365,7 @@ export async function formatSnapshotGrepOutput(
 		throwIfAborted(signal);
 		let lines = fileCache.get(match.filePath);
 		if (!lines) {
-			const fileText = await readSnapshotTextFile(snapshotPath, match.filePath);
+			const fileText = await readScannableSnapshotTextFile(snapshotPath, match.filePath, signal);
 			if (fileText === null) continue;
 			lines = normalizeNewlines(fileText).split("\n");
 			fileCache.set(match.filePath, lines);

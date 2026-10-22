@@ -183,3 +183,23 @@ test("snapshot scans skip dangling and escaping symlink entries", async () => {
 		await rm(outside, { recursive: true, force: true });
 	}
 });
+
+test("JavaScript scan and output skip missing entries next to valid files", async () => {
+	const directory = await createSnapshotFile({ "a.txt": "match\n" });
+	try {
+		const snapshot = { path: directory, commit: "0".repeat(40) };
+		const files = ["missing.txt", "a.txt"];
+		const fallback = await grepSnapshotWithJavaScript(snapshot, { repo: "fixture/missing", pattern: "match" }, files, 10);
+		assert.deepEqual(fallback.matches, [{ filePath: "a.txt", lineNumber: 1 }]);
+		const formatted = await formatSnapshotGrepOutput(
+			directory,
+			[{ filePath: "missing.txt", lineNumber: 1 }, ...fallback.matches],
+			{ files, filterBase: "", isDirectorySearch: true },
+			0,
+		);
+		assert.match(formatted.output, /a\.txt:1: match/);
+		assert.doesNotMatch(formatted.output, /missing/);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
