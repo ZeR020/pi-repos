@@ -6,6 +6,11 @@ Maintained by [ZeR020](https://github.com/ZeR020).
 
 `pi-repos` gives agents a small set of repository tools for finding GitHub repos, searching code examples, listing files, reading code, finding files by glob, and grepping source. It uses GitHub APIs plus a local archive cache so repeated reads/searches are fast without cloning into your current project.
 
+## Requirements
+
+- Pi 1.4.0 or newer.
+- Node.js 22.19.0 or newer.
+
 ## Installation
 
 Install from GitHub:
@@ -65,13 +70,38 @@ The extension reads these optional environment variables:
 | `PI_REPOS_CACHE_DIR` | Cache root for downloaded repository archives. Defaults to `~/.cache/pi-repos`. |
 | `PI_REPOS_REF_REFRESH_MS` | How long cached ref-to-commit lookups are considered fresh. Defaults to 5 minutes. |
 
+## Support
+
+Report problems or request changes in [GitHub issues](https://github.com/ZeR020/pi-repos/issues).
+
 ## Development
 
+Development dependencies are development-only. Pi supplies the runtime host packages (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`); they are declared as optional peers and are never bundled.
+
 ```bash
-npm install --ignore-scripts
-npm run check
-pi -e .
+npm ci --ignore-scripts          # install the locked toolchain without lifecycle scripts
+npm run check                    # typecheck + node:test suite
+npm audit --audit-level=high     # fail on high or critical advisories
+npm pack --dry-run --ignore-scripts
+pi -e .                          # load this checkout in Pi
 ```
+
+Pull requests and pushes to `main` run the same checks on Node 22 and 24 in GitHub Actions (`.github/workflows/ci.yml`): locked install with scripts disabled, typecheck and tests, full dependency audit, and validation of the files `npm pack` would publish.
+
+## Releases
+
+Releases are GitHub releases built from matching `vMAJOR.MINOR.PATCH` tags. Nothing is published to npm.
+
+1. Set `version` in `package.json` and refresh the lockfile with `npm install --package-lock-only --ignore-scripts`.
+2. Merge the version change to `main`.
+3. Tag that commit and push the tag:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` then checks that the tag equals `v` plus the package version, that the tagged commit is reachable from `main`, and that typecheck, tests, and the dependency audit pass. On success the release job, which is the only job granted write access, creates the GitHub release from the `npm pack` tarball and a `SHA256SUMS` checksum file.
 
 ## Notes
 
