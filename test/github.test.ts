@@ -243,6 +243,33 @@ test("repository identifiers reject unsafe owner and name segments", () => {
 	assert.deepEqual(parseRepoInput("https://github.com/owner/name/tree/main/src"), { owner: "owner", name: "name" });
 });
 
+test("repository identifiers use GitHub's owner and name character sets", () => {
+	for (const input of [
+		"fixture/a?b",
+		"fixture/a#b",
+		"fixture/a b",
+		"fixture/a:b",
+		"fixture/a%b",
+		"fixture/a+b",
+		"fixture/a@b",
+		"https://github.com/fixture/a%3Fb",
+		"https://github.com/fixture/a%23b",
+	]) {
+		assert.throws(() => parseRepoInput(input), /Invalid repository/, input);
+	}
+	assert.deepEqual(parseRepoInput("ZeR020/pi-repos"), { owner: "ZeR020", name: "pi-repos" });
+	assert.deepEqual(parseRepoInput("fixture/.github"), { owner: "fixture", name: ".github" });
+	assert.deepEqual(parseRepoInput("fixture/a_b.c-d"), { owner: "fixture", name: "a_b.c-d" });
+	assert.deepEqual(parseRepoInput("Upper/Case"), { owner: "Upper", name: "Case" });
+});
+
+test("invalid identifiers cannot alias a valid repository cache entry", () => {
+	assert.deepEqual(parseRepoInput("fixture/a_b"), { owner: "fixture", name: "a_b" });
+	for (const alias of ["fixture/a?b", "fixture/a#b", "fixture/a b", "fixture/a:b"]) {
+		assert.throws(() => parseRepoInput(alias), /Invalid repository/, alias);
+	}
+});
+
 test("files without inline content are re-read from the contents endpoint", async () => {
 	const largeFileBody = {
 		...fileBody,

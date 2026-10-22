@@ -132,10 +132,11 @@ export function parseRepoInput(input: string): GitHubRepo {
 	return parseRepoLocatorInput(input).repo;
 }
 
-const UNSAFE_REPO_SEGMENT_CHARS = /[/\\\u0000-\u001f]/;
+const REPO_OWNER_PATTERN = /^[A-Za-z0-9-]+$/;
+const REPO_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
 
-function validateRepoSegment(segment: string, input: string): string {
-	if (!segment || segment === "." || segment === ".." || UNSAFE_REPO_SEGMENT_CHARS.test(segment)) {
+function validateRepoSegment(segment: string, input: string, pattern: RegExp): string {
+	if (segment === "." || segment === ".." || !pattern.test(segment)) {
 		throw new Error(`Invalid repository identifier: ${input}`);
 	}
 	return segment;
@@ -157,8 +158,8 @@ export function parseRepoLocatorInput(input: string): GitHubRepoLocator {
 		}
 		if (parts.length < 2) throw new Error(`Invalid GitHub repository URL: ${input}`);
 		const repo = {
-			owner: validateRepoSegment(parts[0], input),
-			name: validateRepoSegment(parts[1].replace(/\.git$/, ""), input),
+			owner: validateRepoSegment(parts[0], input, REPO_OWNER_PATTERN),
+			name: validateRepoSegment(parts[1].replace(/\.git$/, ""), input, REPO_NAME_PATTERN),
 		};
 		const urlKind = parts[2];
 		if (urlKind === "blob" || urlKind === "tree") {
@@ -171,8 +172,8 @@ export function parseRepoLocatorInput(input: string): GitHubRepoLocator {
 		return { repo };
 	}
 	const [ownerInput, nameInput] = trimmed.split("/");
-	const owner = validateRepoSegment(ownerInput ?? "", input);
-	const name = validateRepoSegment((nameInput ?? "").replace(/\.git$/, ""), input);
+	const owner = validateRepoSegment(ownerInput ?? "", input, REPO_OWNER_PATTERN);
+	const name = validateRepoSegment((nameInput ?? "").replace(/\.git$/, ""), input, REPO_NAME_PATTERN);
 	return { repo: { owner, name } };
 }
 
