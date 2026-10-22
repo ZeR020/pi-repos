@@ -22,6 +22,8 @@ import {
 	listRepoSnapshot,
 	prefetchRepoSnapshot,
 	refreshCachedRepoStateInBackground,
+	resolveSnapshotPath,
+	UnsafeRepoPathError,
 } from "./snapshot.ts";
 import type { GitHubCodeSearchResponse, GitHubContentFile, GitHubContentObject, GitHubContentsDirectory, GitHubRepo, GitHubRepoSearchResponse } from "./types.ts";
 import {
@@ -42,11 +44,11 @@ type RepoPathParams = { repo: string; ref?: string; path?: string };
 
 function resolveRepoPathParams(params: RepoPathParams): { repo: GitHubRepo; ref?: string; path: string } {
 	const locator = parseRepoLocatorInput(params.repo);
-	return {
-		repo: locator.repo,
-		ref: params.ref ?? locator.ref,
-		path: normalizeRepoPath(params.path ?? locator.path),
-	};
+	const path = normalizeRepoPath(params.path ?? locator.path);
+	if (path.split(/[\\/]/).includes("..") || path.includes("\0") || /^[A-Za-z]:/.test(path) || path.startsWith("\\")) {
+		throw new UnsafeRepoPathError(path);
+	}
+	return { repo: locator.repo, ref: params.ref ?? locator.ref, path };
 }
 
 function buildCodeSearchQuery(params: { query: string; repo?: string; language?: string; path?: string }): string {
@@ -72,14 +74,15 @@ const repoFindTool = defineTool({
 		query: Type.String({ description: "Repository search query." }),
 		limit: Type.Optional(Type.Number({ minimum: 1, maximum: 20, description: "Maximum number of repositories." })),
 	}),
-	async execute(_toolCallId, params) {
+	async execute(_toolCallId, params, signal) {
+		signal?.throwIfAborted();
 		const searchParams = new URLSearchParams({
 			q: params.query,
 			per_page: String(params.limit ?? 5),
 			sort: "stars",
 			order: "desc",
 		});
-		const response = await githubJson<GitHubRepoSearchResponse>(`/search/repositories?${searchParams.toString()}`);
+		const response = await githubJson<GitHubRepoSearchResponse>(`/search/repositories?${searchParams.toString()}`, undefined, undefined, signal);
 		const lines = response.items.map((item, index) => {
 			const description = formatRepoSearchDescription(item.description);
 			return `${index + 1}. ${item.full_name} (${formatNumber(item.stargazers_count)} stars)${description}\n   ${item.html_url}`;
@@ -113,7 +116,8 @@ const repoCodeSearchTool = defineTool({
 		path: Type.Optional(Type.String({ description: "Optional path qualifier to narrow results, for example src or examples." })),
 		limit: Type.Optional(Type.Number({ minimum: 1, maximum: 50, description: "Maximum number of code results." })),
 	}),
-	async execute(_toolCallId, params) {
+	async execute(_toolCallId, params, signal) {
+		signal?.throwIfAborted();
 		const query = buildCodeSearchQuery(params);
 		if (!query) throw new Error("query is required");
 		const searchParams = new URLSearchParams({
@@ -123,6 +127,8 @@ const repoCodeSearchTool = defineTool({
 		const response = await githubJson<GitHubCodeSearchResponse>(
 			`/search/code?${searchParams.toString()}`,
 			"application/vnd.github.text-match+json",
+			undefined,
+			signal,
 		);
 		const output = formatCodeSearchOutput(response.items);
 		return {
@@ -160,21 +166,24 @@ const repoListTool = defineTool({
 		path: Type.Optional(Type.String({ description: "Directory path inside the repository. Omit for the root directory." })),
 		limit: Type.Optional(Type.Number({ minimum: 1, maximum: 5000, description: "Maximum number of entries to return." })),
 	}),
-	async execute(_toolCallId, params) {
+	async execute(_toolCallId, params, signal) {
+		signal?.throwIfAborted();
 		const { repo, ref, path } = resolveRepoPathParams(params);
-		const cachedState = await getCachedRepoState(repo, ref);
+		const cachedState = await getCachedRepoState(repo, ref, signal);
 		if (cachedState) {
 			refreshCachedRepoStateInBackground(repo, cachedState);
-			return await listRepoSnapshot(cachedState, path, params.limit);
+			return await listRepoSnapshot(cachedState, path, params.limit, signal);
 		}
 
-		const resolvedRef = await resolveRepoRef(repo, ref);
+		const resolvedRef = await resolveRepoRef(repo, ref, signal);
 		prefetchRepoSnapshot(repo, resolvedRef);
 		const refQuery = resolvedRef ? `?ref=${encodeURIComponent(resolvedRef)}` : "";
 		const encodedPath = path ? `/${encodePath(path)}` : "";
 		const result = await githubJson<GitHubContentsDirectory | GitHubContentObject>(
 			`/repos/${repo.owner}/${repo.name}/contents${encodedPath}${refQuery}`,
 			"application/vnd.github.object+json",
+			undefined,
+			signal,
 		);
 		const asFile = result as Partial<GitHubContentFile>;
 		if (asFile.type === "file") {
@@ -216,10 +225,11 @@ const repoReadTool = defineTool({
 		limit: Type.Optional(Type.Number({ minimum: 1, maximum: 2000, description: `Maximum number of lines to read (default: ${DEFAULT_REPO_READ_LIMIT}).` })),
 	}),
 	async execute(toolCallId, params, signal, onUpdate, ctx) {
+		signal?.throwIfAborted();
 		const { repo, ref, path } = resolveRepoPathParams(params);
 		if (!path) throw new Error("path is required");
 		const effectiveLimit = params.limit ?? DEFAULT_REPO_READ_LIMIT;
-		let state = await getCachedRepoState(repo, ref);
+		let state = await getCachedRepoState(repo, ref, signal);
 		try {
 			if (!state) {
 				onUpdate?.({ content: [{ type: "text", text: "Preparing cached GitHub archive..." }], details: {} });
@@ -227,10 +237,11 @@ const repoReadTool = defineTool({
 			} else {
 				refreshCachedRepoStateInBackground(repo, state);
 			}
+			const absolutePath = await resolveSnapshotPath(state.snapshot.path, path);
 			const readTool = createReadToolDefinition(state.snapshot.path);
 			const result = await readTool.execute(
 				toolCallId,
-				{ path, offset: params.offset, limit: effectiveLimit },
+				{ path: absolutePath, offset: params.offset, limit: effectiveLimit },
 				signal,
 				onUpdate,
 				ctx,
@@ -246,12 +257,12 @@ const repoReadTool = defineTool({
 				}),
 			};
 		} catch (error) {
-			if (signal?.aborted) throw error;
+			if (signal?.aborted || error instanceof UnsafeRepoPathError) throw error;
 			const fallbackReason = error instanceof Error ? error.message : String(error);
 			onUpdate?.({ content: [{ type: "text", text: "Cached archive unavailable; falling back to GitHub REST file read..." }], details: {} });
-			const resolvedRef = state?.ref ?? await resolveRepoRef(repo, ref);
+			const resolvedRef = state?.ref ?? await resolveRepoRef(repo, ref, signal);
 			prefetchRepoSnapshot(repo, resolvedRef);
-			const text = await getRepoFileText(repo, resolvedRef, path);
+			const text = await getRepoFileText(repo, resolvedRef, path, signal);
 			const output = formatReadOutput(text, params.offset, effectiveLimit);
 			return {
 				content: [{ type: "text", text: output.text }],
@@ -283,13 +294,14 @@ const repoFindFilesTool = defineTool({
 		path: Type.Optional(Type.String({ description: "Directory to search in (default: repo root)." })),
 		limit: Type.Optional(Type.Number({ minimum: 1, maximum: 5000, description: "Maximum number of results to return." })),
 	}),
-	async execute(_toolCallId, params) {
+	async execute(_toolCallId, params, signal) {
+		signal?.throwIfAborted();
 		const { repo, ref: requestedRef, path: searchPath } = resolveRepoPathParams(params);
-		const cachedState = await getCachedRepoState(repo, requestedRef);
-		const ref = cachedState?.ref ?? await resolveRepoRef(repo, requestedRef);
+		const cachedState = await getCachedRepoState(repo, requestedRef, signal);
+		const ref = cachedState?.ref ?? await resolveRepoRef(repo, requestedRef, signal);
 		if (cachedState) refreshCachedRepoStateInBackground(repo, cachedState);
 		else prefetchRepoSnapshot(repo, ref);
-		const tree = cachedState?.tree ?? (await getRepoTree(repo, ref)).tree;
+		const tree = cachedState?.tree ?? (await getRepoTree(repo, ref, signal)).tree;
 		assertDirectoryPath(tree, searchPath);
 		const matcher = createGlobMatcher(params.pattern);
 		const effectiveLimit = params.limit ?? DEFAULT_FIND_LIMIT;
@@ -348,9 +360,10 @@ const repoGrepTool = defineTool({
 		limit: Type.Optional(Type.Number({ minimum: 1, maximum: 1000, description: "Maximum number of matches to return." })),
 	}),
 	async execute(_toolCallId, params, signal, onUpdate) {
+		signal?.throwIfAborted();
 		const { repo, ref, path } = resolveRepoPathParams(params);
 		validateGrepPattern(params.pattern, Boolean(params.literal), Boolean(params.ignoreCase));
-		const cachedState = await getCachedRepoState(repo, ref);
+		const cachedState = await getCachedRepoState(repo, ref, signal);
 		let state = cachedState;
 		try {
 			if (!state) {
@@ -359,6 +372,7 @@ const repoGrepTool = defineTool({
 			} else {
 				refreshCachedRepoStateInBackground(repo, state);
 			}
+			await resolveSnapshotPath(state.snapshot.path, path);
 			const normalizedPath = path;
 			const grepTarget = resolveGrepTarget(state.tree, normalizedPath);
 			const fileMatcher = params.glob ? createGlobMatcher(params.glob) : null;
@@ -382,19 +396,19 @@ const repoGrepTool = defineTool({
 				}),
 			};
 		} catch (error) {
-			if (signal?.aborted) throw error;
+			if (signal?.aborted || error instanceof UnsafeRepoPathError) throw error;
 			const fallbackReason = error instanceof Error ? error.message : String(error);
 			onUpdate?.({ content: [{ type: "text", text: "Cached archive unavailable; falling back to GitHub REST scan..." }], details: {} });
-			const requestedRef = state?.ref ?? await resolveRepoRef(repo, ref);
-			const commitSha = state?.commit ?? await getRepoCommitSha(repo, requestedRef);
-			const { tree } = state ?? await getRepoTree(repo, commitSha);
+			const requestedRef = state?.ref ?? await resolveRepoRef(repo, ref, signal);
+			const commitSha = state?.commit ?? await getRepoCommitSha(repo, requestedRef, signal);
+			const { tree } = state ?? await getRepoTree(repo, commitSha, signal);
 			const normalizedPath = path;
 			const grepTarget = resolveGrepTarget(tree, normalizedPath);
 			const fileMatcher = params.glob ? createGlobMatcher(params.glob) : null;
 			const filesToScan = grepTarget.files
 				.filter(filePath => !fileMatcher || fileMatcher(relativeToPath(filePath, grepTarget.filterBase)))
 				.sort(compareCaseInsensitive);
-			return await grepRepoViaGitHubRest(repo, commitSha, normalizedPath, grepTarget, filesToScan, params, fallbackReason);
+			return await grepRepoViaGitHubRest(repo, commitSha, normalizedPath, grepTarget, filesToScan, params, fallbackReason, signal);
 		}
 	},
 	renderCall(args, theme, context) {

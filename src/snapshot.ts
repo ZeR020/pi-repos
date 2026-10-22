@@ -26,7 +26,8 @@ import type { CachedRepoState, GitHubRepo, GitHubTreeEntry, GitHubTreeResponse, 
 const execFileAsync = promisify(execFile);
 const repoSnapshotCache = new Map<string, Promise<RepoSnapshot>>();
 
-export async function getCachedRepoState(repo: GitHubRepo, ref?: string): Promise<CachedRepoState | null> {
+export async function getCachedRepoState(repo: GitHubRepo, ref?: string, signal?: AbortSignal): Promise<CachedRepoState | null> {
+	signal?.throwIfAborted();
 	const requestedRef = ref?.trim() || (await readRepoMetadataCache(repo))?.defaultBranch;
 	if (!requestedRef) return null;
 	const refCache = looksLikeCommitSha(requestedRef) ? null : await readRepoRefCache(repo, requestedRef);
@@ -34,7 +35,7 @@ export async function getCachedRepoState(repo: GitHubRepo, ref?: string): Promis
 	if (!commit) return null;
 	const snapshotPath = getRepoSnapshotPath(repo, commit);
 	if (!(await pathExists(join(snapshotPath, REPO_CACHE_COMPLETE_MARKER)))) return null;
-	const tree = await getOrCreateSnapshotTree(repo, commit, snapshotPath);
+	const tree = await getOrCreateSnapshotTree(repo, commit, snapshotPath, signal);
 	return {
 		ref: requestedRef,
 		commit,
@@ -45,12 +46,12 @@ export async function getCachedRepoState(repo: GitHubRepo, ref?: string): Promis
 }
 
 export async function getRepoStateWithSnapshot(repo: GitHubRepo, ref?: string, signal?: AbortSignal): Promise<CachedRepoState> {
-	const cachedState = await getCachedRepoState(repo, ref);
+	const cachedState = await getCachedRepoState(repo, ref, signal);
 	if (cachedState) return cachedState;
-	const requestedRef = await resolveRepoRef(repo, ref);
-	const commit = await getRepoCommitSha(repo, requestedRef);
+	const requestedRef = await resolveRepoRef(repo, ref, signal);
+	const commit = await getRepoCommitSha(repo, requestedRef, signal);
 	const snapshot = await getRepoSnapshot(repo, commit, signal);
-	const tree = await getOrCreateSnapshotTree(repo, commit, snapshot.path);
+	const tree = await getOrCreateSnapshotTree(repo, commit, snapshot.path, signal);
 	return { ref: requestedRef, commit, tree, snapshot, refUpdatedAt: Date.now() };
 }
 
@@ -73,7 +74,9 @@ export async function listRepoSnapshot(
 	state: CachedRepoState,
 	path: string,
 	limit?: number,
+	signal?: AbortSignal,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }> {
+	signal?.throwIfAborted();
 	const target = await resolveSnapshotPath(state.snapshot.path, path);
 	const stats = await lstat(target);
 	if (stats.isFile()) throw new Error(`${path || "/"} is a file. Use repo_read instead.`);
@@ -81,6 +84,7 @@ export async function listRepoSnapshot(
 	const entries = (await readdir(target, { withFileTypes: true }))
 		.filter(entry => !(path === "" && entry.name === REPO_CACHE_COMPLETE_MARKER))
 		.map(entry => ({ name: entry.name, type: entry.isDirectory() ? "dir" : "file" }));
+	signal?.throwIfAborted();
 	const output = formatDirectoryListOutput(entries, limit);
 	return {
 		content: [{ type: "text", text: output.text }],
@@ -97,6 +101,8 @@ export async function listRepoSnapshot(
 }
 
 export async function getRepoSnapshot(repo: GitHubRepo, commitSha: string, signal?: AbortSignal): Promise<RepoSnapshot> {
+	signal?.throwIfAborted();
+	if (signal) return createRepoSnapshot(repo, commitSha, signal);
 	const key = `${repoKey(repo)}@${commitSha}`;
 	let cached = repoSnapshotCache.get(key);
 	if (!cached) {
@@ -109,19 +115,23 @@ export async function getRepoSnapshot(repo: GitHubRepo, commitSha: string, signa
 	return cached;
 }
 
-export async function getOrCreateSnapshotTree(repo: GitHubRepo, commitSha: string, snapshotPath: string): Promise<GitHubTreeResponse> {
+export async function getOrCreateSnapshotTree(repo: GitHubRepo, commitSha: string, snapshotPath: string, signal?: AbortSignal): Promise<GitHubTreeResponse> {
+	signal?.throwIfAborted();
 	const cachedTree = await readRepoTreeCache(repo, commitSha);
+	signal?.throwIfAborted();
 	if (cachedTree) return cachedTree;
-	const tree = await generateSnapshotTree(snapshotPath);
+	const tree = await generateSnapshotTree(snapshotPath, signal);
 	await writeRepoTreeCache(repo, commitSha, tree);
 	return tree;
 }
 
-export async function generateSnapshotTree(snapshotPath: string): Promise<GitHubTreeResponse> {
+export async function generateSnapshotTree(snapshotPath: string, signal?: AbortSignal): Promise<GitHubTreeResponse> {
 	const tree: GitHubTreeEntry[] = [];
 	async function walk(directory: string, relativeDirectory: string): Promise<void> {
+		signal?.throwIfAborted();
 		const entries = await readdir(directory, { withFileTypes: true });
 		for (const entry of entries) {
+			signal?.throwIfAborted();
 			if (!relativeDirectory && entry.name === REPO_CACHE_COMPLETE_MARKER) continue;
 			const relativePath = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
 			if (entry.isDirectory()) {
