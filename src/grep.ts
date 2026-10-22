@@ -1,9 +1,10 @@
 import { execFile, spawn } from "node:child_process";
+import { lstat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { DEFAULT_MAX_BYTES, formatSize, truncateHead, truncateLine } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_GREP_LIMIT, GREP_MAX_LINE_LENGTH, RIPGREP_CHUNK_SIZE, RIPGREP_MAX_ARG_BYTES } from "./constants.ts";
-import { getRepoFileText } from "./github.ts";
-import { readSnapshotTextFile } from "./snapshot.ts";
+import { getRepoFileText, throwIfAborted } from "./github.ts";
+import { readSnapshotTextFile, resolveSnapshotPath } from "./snapshot.ts";
 import {
 	basenamePath,
 	compareCaseInsensitive,
@@ -16,6 +17,7 @@ import {
 import type { GitHubRepo, GrepLineMatch, GrepTarget, RepoGrepParams, RepoGrepResult, RepoSnapshot, RipgrepJsonEvent, SnapshotGrepSearch } from "./types.ts";
 
 const execFileAsync = promisify(execFile);
+const SCAN_YIELD_INTERVAL = 2048;
 let cachedRipgrepAvailable: Promise<boolean> | null = null;
 
 export async function grepRepoSnapshot(
@@ -25,15 +27,16 @@ export async function grepRepoSnapshot(
 	filesToScan: string[],
 	signal?: AbortSignal,
 ): Promise<RepoGrepResult> {
+	throwIfAborted(signal);
 	const effectiveLimit = params.limit ?? DEFAULT_GREP_LIMIT;
 	const contextValue = params.context && params.context > 0 ? params.context : 0;
 	let fallbackReason: string | undefined;
 	let search = await grepSnapshotWithRipgrep(snapshot, params, grepTarget, filesToScan, effectiveLimit, signal);
 	if (!search) {
 		fallbackReason = "ripgrep unavailable or could not run this pattern; used local JavaScript scan";
-		search = await grepSnapshotWithJavaScript(snapshot, params, filesToScan, effectiveLimit);
+		search = await grepSnapshotWithJavaScript(snapshot, params, filesToScan, effectiveLimit, signal);
 	}
-	const formatted = await formatSnapshotGrepOutput(snapshot.path, search.matches, grepTarget, contextValue);
+	const formatted = await formatSnapshotGrepOutput(snapshot.path, search.matches, grepTarget, contextValue, signal);
 	let output = formatted.output;
 	const notices: string[] = [];
 	if (search.matchLimitReached) {
@@ -70,7 +73,9 @@ export async function grepRepoViaGitHubRest(
 	filesToScan: string[],
 	params: RepoGrepParams,
 	fallbackReason?: string,
+	signal?: AbortSignal,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }> {
+	throwIfAborted(signal);
 	const effectiveLimit = params.limit ?? DEFAULT_GREP_LIMIT;
 	const contextValue = params.context && params.context > 0 ? params.context : 0;
 	const matchLine = createLineMatcher(params.pattern, Boolean(params.literal), Boolean(params.ignoreCase));
@@ -79,10 +84,12 @@ export async function grepRepoViaGitHubRest(
 	let matchLimitReached = false;
 	let linesTruncated = false;
 	for (const filePath of filesToScan) {
-		const fileText = await getRepoFileText(repo, ref, filePath);
+		throwIfAborted(signal);
+		const fileText = await getRepoFileText(repo, ref, filePath, signal);
 		if (looksBinary(fileText)) continue;
 		const lines = normalizeNewlines(fileText).split("\n");
 		for (let index = 0; index < lines.length; index++) {
+			if (index % SCAN_YIELD_INTERVAL === 0) await yieldScanProgress(signal);
 			if (!matchLine(lines[index])) continue;
 			matchCount++;
 			const displayPath = grepTarget.isDirectorySearch
@@ -152,6 +159,7 @@ export async function grepSnapshotWithRipgrep(
 	effectiveLimit: number,
 	signal?: AbortSignal,
 ): Promise<SnapshotGrepSearch | null> {
+	throwIfAborted(signal);
 	if (params.literal && params.pattern === "") return null;
 	if (params.pattern.includes("\n") || params.pattern.includes("\r")) return null;
 	if (!(await hasRipgrep())) return null;
@@ -163,6 +171,7 @@ export async function grepSnapshotWithRipgrep(
 		: [[grepTarget.isDirectorySearch ? grepTarget.filterBase || "." : filesToScan[0]].filter(Boolean)];
 	for (const targets of targetChunks) {
 		if (targets.length === 0) continue;
+		throwIfAborted(signal);
 		const result = await runRipgrepChunk(snapshot.path, params, targets, filesToScanSet, effectiveLimit - allMatches.length, signal);
 		if (!result) return null;
 		allMatches.push(...result.matches);
@@ -174,6 +183,81 @@ export async function grepSnapshotWithRipgrep(
 	return { backend: "github-archive-rg", matches: dedupeMatches(allMatches), matchLimitReached };
 }
 
+async function yieldScanProgress(signal?: AbortSignal): Promise<void> {
+	throwIfAborted(signal);
+	await new Promise<void>(resolve => setImmediate(resolve));
+	throwIfAborted(signal);
+}
+
+// Missing, dangling, and escaping entries are skipped; access and I/O failures must reach the
+// caller so it can fall back to REST instead of reporting a completed negative search.
+const SKIPPED_SNAPSHOT_ENTRY_CODES = new Set(["ENOENT", "ENOTDIR", "ELOOP"]);
+
+function isSkippableSnapshotEntryError(error: unknown): boolean {
+	if (error instanceof Error && (error.name === "UnsafeRepoPathError" || error.message.startsWith("Unsafe repository path: "))) {
+		return true;
+	}
+	const code = (error as NodeJS.ErrnoException | undefined)?.code;
+	return typeof code === "string" && SKIPPED_SNAPSHOT_ENTRY_CODES.has(code);
+}
+
+async function selectScannableTargets(cwd: string, targets: string[], signal?: AbortSignal): Promise<string[]> {
+	const scannableTargets: string[] = [];
+	for (const target of targets) {
+		throwIfAborted(signal);
+		try {
+			// Awaited so the check keeps working when resolveSnapshotPath becomes async.
+			const stats = await lstat(await resolveSnapshotPath(cwd, target));
+			if (stats.isFile() || stats.isDirectory()) scannableTargets.push(target);
+		} catch (error) {
+			if (!isSkippableSnapshotEntryError(error)) throw error;
+		}
+	}
+	return scannableTargets;
+}
+
+async function readScannableSnapshotTextFile(snapshotPath: string, filePath: string, signal?: AbortSignal): Promise<string | null> {
+	throwIfAborted(signal);
+	try {
+		// Awaited so the check keeps working when resolveSnapshotPath becomes async.
+		const stats = await lstat(await resolveSnapshotPath(snapshotPath, filePath));
+		if (!stats.isFile()) return null;
+		return await readSnapshotTextFile(snapshotPath, filePath);
+	} catch (error) {
+		if (!isSkippableSnapshotEntryError(error)) throw error;
+		return null;
+	}
+}
+
+export function createRipgrepMatchCollector(
+	filesToScanSet: Set<string>,
+	limit: number,
+): { readonly matches: GrepLineMatch[]; readonly done: boolean; push: (chunk: string) => void } {
+	let stdoutBuffer = "";
+	const matches: GrepLineMatch[] = [];
+	const limitReached = () => matches.length >= limit;
+	return {
+		get matches() {
+			return matches;
+		},
+		get done() {
+			return limitReached();
+		},
+		push(chunk: string) {
+			if (limitReached()) return;
+			stdoutBuffer += chunk;
+			let newlineIndex = stdoutBuffer.indexOf("\n");
+			while (newlineIndex >= 0 && !limitReached()) {
+				const line = stdoutBuffer.slice(0, newlineIndex);
+				stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+				const match = parseRipgrepMatchLine(line, filesToScanSet);
+				if (match) matches.push(match);
+				newlineIndex = stdoutBuffer.indexOf("\n");
+			}
+		},
+	};
+}
+
 export async function runRipgrepChunk(
 	cwd: string,
 	params: RepoGrepParams,
@@ -182,17 +266,18 @@ export async function runRipgrepChunk(
 	remainingLimit: number,
 	signal?: AbortSignal,
 ): Promise<{ matches: GrepLineMatch[]; matchLimitReached: boolean } | null> {
+	throwIfAborted(signal);
 	if (remainingLimit <= 0) return { matches: [], matchLimitReached: true };
-	const args = ["--json", "--line-number", "--color=never", "--no-heading", "--no-ignore", "--hidden"];
+	const scannableTargets = await selectScannableTargets(cwd, targets, signal);
+	if (scannableTargets.length === 0) return { matches: [], matchLimitReached: false };
+	const args = ["--json", "--line-number", "--color=never", "--no-heading", "--no-ignore", "--hidden", "--no-config"];
 	if (params.literal) args.push("--fixed-strings");
 	if (params.ignoreCase) args.push("--ignore-case");
-	args.push("--", params.pattern, ...targets);
-	return await new Promise((resolvePromise, reject) => {
+	args.push("--", params.pattern, ...scannableTargets);
+	return new Promise((resolvePromise, reject) => {
 		const child = spawn("rg", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-		const matches: GrepLineMatch[] = [];
-		let stdoutBuffer = "";
+		const collector = createRipgrepMatchCollector(filesToScanSet, remainingLimit);
 		let stderr = "";
-		let matchLimitReached = false;
 		const abortHandler = () => child.kill("SIGTERM");
 		if (signal?.aborted) {
 			child.kill("SIGTERM");
@@ -201,22 +286,9 @@ export async function runRipgrepChunk(
 		}
 		child.stdout.setEncoding("utf8");
 		child.stdout.on("data", chunk => {
-			stdoutBuffer += chunk;
-			let newlineIndex = stdoutBuffer.indexOf("\n");
-			while (newlineIndex >= 0) {
-				const line = stdoutBuffer.slice(0, newlineIndex);
-				stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-				const match = parseRipgrepMatchLine(line, filesToScanSet);
-				if (match) {
-					matches.push(match);
-					if (matches.length >= remainingLimit) {
-						matchLimitReached = true;
-						child.kill("SIGTERM");
-						break;
-					}
-				}
-				newlineIndex = stdoutBuffer.indexOf("\n");
-			}
+			if (collector.done) return;
+			collector.push(chunk);
+			if (collector.done) child.kill("SIGTERM");
 		});
 		child.stderr.setEncoding("utf8");
 		child.stderr.on("data", chunk => {
@@ -231,11 +303,11 @@ export async function runRipgrepChunk(
 		child.on("close", code => {
 			signal?.removeEventListener("abort", abortHandler);
 			if (signal?.aborted) {
-				reject(new Error("repo_grep cancelled"));
+				reject(signal.reason);
 				return;
 			}
-			if (matchLimitReached || code === 0 || code === 1) {
-				resolvePromise({ matches, matchLimitReached });
+			if (collector.done || code === 0 || code === 1) {
+				resolvePromise({ matches: collector.matches, matchLimitReached: collector.done });
 				return;
 			}
 			resolvePromise(null);
@@ -264,15 +336,19 @@ export async function grepSnapshotWithJavaScript(
 	params: RepoGrepParams,
 	filesToScan: string[],
 	effectiveLimit: number,
+	signal?: AbortSignal,
 ): Promise<SnapshotGrepSearch> {
+	throwIfAborted(signal);
 	const matchLine = createLineMatcher(params.pattern, Boolean(params.literal), Boolean(params.ignoreCase));
 	const matches: GrepLineMatch[] = [];
 	let matchLimitReached = false;
 	for (const filePath of filesToScan) {
-		const fileText = await readSnapshotTextFile(snapshot.path, filePath);
+		throwIfAborted(signal);
+		const fileText = await readScannableSnapshotTextFile(snapshot.path, filePath, signal);
 		if (fileText === null || looksBinary(fileText)) continue;
 		const lines = normalizeNewlines(fileText).split("\n");
 		for (let index = 0; index < lines.length; index++) {
+			if (index % SCAN_YIELD_INTERVAL === 0) await yieldScanProgress(signal);
 			if (!matchLine(lines[index])) continue;
 			matches.push({ filePath, lineNumber: index + 1 });
 			if (matches.length >= effectiveLimit) {
@@ -290,15 +366,18 @@ export async function formatSnapshotGrepOutput(
 	matches: GrepLineMatch[],
 	grepTarget: GrepTarget,
 	contextValue: number,
+	signal?: AbortSignal,
 ): Promise<{ output: string; linesTruncated: boolean }> {
+	throwIfAborted(signal);
 	if (matches.length === 0) return { output: "No matches found", linesTruncated: false };
 	const outputLines: string[] = [];
 	const fileCache = new Map<string, string[]>();
 	let linesTruncated = false;
 	for (const match of dedupeMatches(matches).sort(compareGrepLineMatches)) {
+		throwIfAborted(signal);
 		let lines = fileCache.get(match.filePath);
 		if (!lines) {
-			const fileText = await readSnapshotTextFile(snapshotPath, match.filePath);
+			const fileText = await readScannableSnapshotTextFile(snapshotPath, match.filePath, signal);
 			if (fileText === null) continue;
 			lines = normalizeNewlines(fileText).split("\n");
 			fileCache.set(match.filePath, lines);

@@ -28,13 +28,40 @@ const repoFileCache = new Map<string, Promise<string>>();
 const repoCommitCache = new Map<string, Promise<string>>();
 let cachedGitHubToken: Promise<string | null> | null = null;
 
+export function throwIfAborted(signal?: AbortSignal): void {
+	signal?.throwIfAborted();
+}
+
+function cachePromise<T>(cache: Map<string, Promise<T>>, key: string, create: () => Promise<T>): Promise<T> {
+	const existing = cache.get(key);
+	if (existing) return existing;
+	const pending = create();
+	cache.set(key, pending);
+	void pending.catch(() => {
+		if (cache.get(key) === pending) cache.delete(key);
+	});
+	return pending;
+}
+
+// Caller-local cancellation for shared work: the awaited promise keeps running, only this wait stops.
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const abortHandler = () => reject(signal.reason);
+		signal.addEventListener("abort", abortHandler, { once: true });
+		void promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abortHandler));
+	});
+}
+
 export async function githubFetch(
 	path: string,
 	accept = "application/vnd.github+json",
 	explicitToken?: string,
 	signal?: AbortSignal,
 ): Promise<Response> {
-	const token = explicitToken ?? (await getGitHubToken());
+	throwIfAborted(signal);
+	const token = explicitToken ?? (signal ? await raceWithAbort(getGitHubToken(), signal) : await getGitHubToken());
+	// The signal may have aborted while token discovery was pending.
+	throwIfAborted(signal);
 	const headers: Record<string, string> = {
 		Accept: accept,
 		"X-GitHub-Api-Version": GITHUB_API_VERSION,
@@ -50,8 +77,13 @@ export async function githubFetch(
 	return response;
 }
 
-export async function githubJson<T>(path: string, accept = "application/vnd.github+json", explicitToken?: string): Promise<T> {
-	const response = await githubFetch(path, accept, explicitToken);
+export async function githubJson<T>(
+	path: string,
+	accept = "application/vnd.github+json",
+	explicitToken?: string,
+	signal?: AbortSignal,
+): Promise<T> {
+	const response = await githubFetch(path, accept, explicitToken, signal);
 	return (await response.json()) as T;
 }
 
@@ -111,17 +143,40 @@ export function parseRepoInput(input: string): GitHubRepo {
 	return parseRepoLocatorInput(input).repo;
 }
 
+const REPO_OWNER_PATTERN = /^[A-Za-z0-9-]+$/;
+const REPO_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+function validateRepoSegment(segment: string, input: string, pattern: RegExp): string {
+	if (segment === "." || segment === ".." || !pattern.test(segment)) {
+		throw new Error(`Invalid repository identifier: ${input}`);
+	}
+	return segment;
+}
+
 export function parseRepoLocatorInput(input: string): GitHubRepoLocator {
 	const trimmed = input.trim();
 	if (!trimmed) throw new Error("Repository is required.");
 	if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
-		const url = new URL(trimmed);
+		let url: URL;
+		try {
+			url = new URL(trimmed);
+		} catch {
+			throw new Error(`Invalid GitHub repository URL: ${input}`);
+		}
 		if (url.hostname !== "github.com") {
 			throw new Error(`Unsupported repository host: ${url.hostname}`);
 		}
-		const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+		let parts: string[];
+		try {
+			parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+		} catch {
+			throw new Error(`Invalid GitHub repository URL: ${input}`);
+		}
 		if (parts.length < 2) throw new Error(`Invalid GitHub repository URL: ${input}`);
-		const repo = { owner: parts[0], name: parts[1].replace(/\.git$/, "") };
+		const repo = {
+			owner: validateRepoSegment(parts[0], input, REPO_OWNER_PATTERN),
+			name: validateRepoSegment(parts[1].replace(/\.git$/, ""), input, REPO_NAME_PATTERN),
+		};
 		const urlKind = parts[2];
 		if (urlKind === "blob" || urlKind === "tree") {
 			const { ref, path } = parseGitHubUrlRefAndPath(parts.slice(3));
@@ -132,9 +187,10 @@ export function parseRepoLocatorInput(input: string): GitHubRepoLocator {
 		}
 		return { repo };
 	}
-	const [owner, name] = trimmed.split("/");
-	if (!owner || !name) throw new Error(`Invalid repository identifier: ${input}`);
-	return { repo: { owner, name: name.replace(/\.git$/, "") } };
+	const [ownerInput, nameInput] = trimmed.split("/");
+	const owner = validateRepoSegment(ownerInput ?? "", input, REPO_OWNER_PATTERN);
+	const name = validateRepoSegment((nameInput ?? "").replace(/\.git$/, ""), input, REPO_NAME_PATTERN);
+	return { repo: { owner, name } };
 }
 
 export function parseGitHubUrlRefAndPath(parts: string[]): { ref?: string; path?: string } {
@@ -148,88 +204,87 @@ export function repoKey(repo: GitHubRepo): string {
 	return `${repo.owner}/${repo.name}`;
 }
 
-export async function getRepoMetadata(repo: GitHubRepo): Promise<GitHubRepoMetadata> {
-	const key = repoKey(repo);
-	let cached = repoMetadataCache.get(key);
-	if (!cached) {
-		cached = githubJson<GitHubRepoMetadata>(`/repos/${repo.owner}/${repo.name}`).then(metadata => {
-			void writeRepoMetadataCache(repo, metadata.default_branch);
-			return metadata;
-		});
-		repoMetadataCache.set(key, cached);
-	}
-	return cached;
+export async function getRepoMetadata(repo: GitHubRepo, signal?: AbortSignal): Promise<GitHubRepoMetadata> {
+	if (signal) return fetchRepoMetadata(repo, signal);
+	return cachePromise(repoMetadataCache, repoKey(repo), () => fetchRepoMetadata(repo));
 }
 
-export async function resolveRepoRef(repo: GitHubRepo, ref?: string): Promise<string> {
+async function fetchRepoMetadata(repo: GitHubRepo, signal?: AbortSignal): Promise<GitHubRepoMetadata> {
+	const metadata = await githubJson<GitHubRepoMetadata>(`/repos/${repo.owner}/${repo.name}`, undefined, undefined, signal);
+	void writeRepoMetadataCache(repo, metadata.default_branch);
+	return metadata;
+}
+
+export async function resolveRepoRef(repo: GitHubRepo, ref?: string, signal?: AbortSignal): Promise<string> {
+	throwIfAborted(signal);
 	if (ref?.trim()) return ref.trim();
 	const cachedMetadata = await readRepoMetadataCache(repo);
 	if (cachedMetadata?.defaultBranch) return cachedMetadata.defaultBranch;
-	const metadata = await getRepoMetadata(repo);
+	const metadata = await getRepoMetadata(repo, signal);
 	return metadata.default_branch;
 }
 
-export async function getRepoTree(repo: GitHubRepo, ref?: string): Promise<{ ref: string; tree: GitHubTreeResponse }> {
-	const resolvedRef = await resolveRepoRef(repo, ref);
-	const key = `${repoKey(repo)}@${resolvedRef}`;
-	let cached = repoTreeCache.get(key);
-	if (!cached) {
-		cached = (async () => {
-			const cachedTree = await readRepoTreeCache(repo, resolvedRef);
-			if (cachedTree) return { ref: resolvedRef, tree: cachedTree };
-			const tree = await githubJson<GitHubTreeResponse>(
-				`/repos/${repo.owner}/${repo.name}/git/trees/${encodeURIComponent(resolvedRef)}?recursive=1`,
-			);
-			if (looksLikeCommitSha(resolvedRef)) void writeRepoTreeCache(repo, resolvedRef, tree);
-			return { ref: resolvedRef, tree };
-		})();
-		repoTreeCache.set(key, cached);
-	}
-	return cached;
+export async function getRepoTree(repo: GitHubRepo, ref?: string, signal?: AbortSignal): Promise<{ ref: string; tree: GitHubTreeResponse }> {
+	throwIfAborted(signal);
+	const resolvedRef = await resolveRepoRef(repo, ref, signal);
+	if (signal) return fetchRepoTree(repo, resolvedRef, signal);
+	return cachePromise(repoTreeCache, `${repoKey(repo)}@${resolvedRef}`, () => fetchRepoTree(repo, resolvedRef));
 }
 
-export async function getRepoFileText(repo: GitHubRepo, ref: string, path: string): Promise<string> {
+async function fetchRepoTree(repo: GitHubRepo, resolvedRef: string, signal?: AbortSignal): Promise<{ ref: string; tree: GitHubTreeResponse }> {
+	const cachedTree = await readRepoTreeCache(repo, resolvedRef);
+	if (cachedTree) return { ref: resolvedRef, tree: cachedTree };
+	const tree = await githubJson<GitHubTreeResponse>(
+		`/repos/${repo.owner}/${repo.name}/git/trees/${encodeURIComponent(resolvedRef)}?recursive=1`,
+		undefined,
+		undefined,
+		signal,
+	);
+	if (looksLikeCommitSha(resolvedRef)) void writeRepoTreeCache(repo, resolvedRef, tree);
+	return { ref: resolvedRef, tree };
+}
+
+export async function getRepoFileText(repo: GitHubRepo, ref: string, path: string, signal?: AbortSignal): Promise<string> {
+	throwIfAborted(signal);
 	const normalizedPath = normalizeRepoPath(path);
-	const key = `${repoKey(repo)}@${ref}:${normalizedPath}`;
-	let cached = repoFileCache.get(key);
-	if (!cached) {
-		cached = githubJson<GitHubContentFile | GitHubContentObject>(
-			`/repos/${repo.owner}/${repo.name}/contents/${encodePath(normalizedPath)}?ref=${encodeURIComponent(ref)}`,
-			"application/vnd.github.object+json",
-		).then(async result => {
-			const file = result as GitHubContentFile;
-			if (file.type !== "file") {
-				throw new Error(`${normalizedPath} is not a file.`);
-			}
-			if (typeof file.content === "string" && file.content.length > 0 && file.encoding === "base64") {
-				return Buffer.from(file.content.replace(/\n/g, ""), "base64").toString("utf8");
-			}
-			if (file.download_url) {
-				const response = await fetch(file.download_url);
-				if (!response.ok) {
-					throw new Error(`Failed to download file contents: ${response.status} ${response.statusText}`);
-				}
-				return await response.text();
-			}
-			throw new Error("GitHub did not return readable file contents.");
-		});
-		repoFileCache.set(key, cached);
-	}
-	return cached;
+	if (signal) return fetchRepoFileText(repo, ref, normalizedPath, signal);
+	return cachePromise(repoFileCache, `${repoKey(repo)}@${ref}:${normalizedPath}`, () => fetchRepoFileText(repo, ref, normalizedPath));
 }
 
-export async function getRepoCommitSha(repo: GitHubRepo, ref: string): Promise<string> {
-	const key = `${repoKey(repo)}@${ref}`;
-	let cached = repoCommitCache.get(key);
-	if (!cached) {
-		cached = fetchRepoCommitSha(repo, ref);
-		repoCommitCache.set(key, cached);
+async function fetchRepoFileText(repo: GitHubRepo, ref: string, normalizedPath: string, signal?: AbortSignal): Promise<string> {
+	const contentsPath = `/repos/${repo.owner}/${repo.name}/contents/${encodePath(normalizedPath)}?ref=${encodeURIComponent(ref)}`;
+	const result = await githubJson<GitHubContentFile | GitHubContentObject>(
+		contentsPath,
+		"application/vnd.github.object+json",
+		undefined,
+		signal,
+	);
+	const file = result as GitHubContentFile;
+	if (file.type !== "file") {
+		throw new Error(`${normalizedPath} is not a file.`);
 	}
-	return cached;
+	if (typeof file.content === "string" && file.content.length > 0 && file.encoding === "base64") {
+		return Buffer.from(file.content.replace(/\n/g, ""), "base64").toString("utf8");
+	}
+	if (file.size === 0) return "";
+	// Files above 1 MB have no inline content; re-read the same endpoint as raw text.
+	const rawResponse = await githubFetch(contentsPath, "application/vnd.github.raw", undefined, signal);
+	return rawResponse.text();
 }
 
-export async function fetchRepoCommitSha(repo: GitHubRepo, ref: string): Promise<string> {
-	const commit = await githubJson<GitHubCommitResponse>(`/repos/${repo.owner}/${repo.name}/commits/${encodeURIComponent(ref)}`);
+export async function getRepoCommitSha(repo: GitHubRepo, ref: string, signal?: AbortSignal): Promise<string> {
+	if (signal) return fetchRepoCommitSha(repo, ref, signal);
+	return cachePromise(repoCommitCache, `${repoKey(repo)}@${ref}`, () => fetchRepoCommitSha(repo, ref));
+}
+
+export async function fetchRepoCommitSha(repo: GitHubRepo, ref: string, signal?: AbortSignal): Promise<string> {
+	throwIfAborted(signal);
+	const commit = await githubJson<GitHubCommitResponse>(
+		`/repos/${repo.owner}/${repo.name}/commits/${encodeURIComponent(ref)}`,
+		undefined,
+		undefined,
+		signal,
+	);
 	await writeRepoRefCache(repo, ref, commit.sha);
 	repoCommitCache.set(`${repoKey(repo)}@${ref}`, Promise.resolve(commit.sha));
 	return commit.sha;
