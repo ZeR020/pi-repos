@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import { lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { Readable } from "node:stream";
@@ -74,7 +74,7 @@ export async function listRepoSnapshot(
 	path: string,
 	limit?: number,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }> {
-	const target = resolveSnapshotPath(state.snapshot.path, path);
+	const target = await resolveSnapshotPath(state.snapshot.path, path);
 	const stats = await lstat(target);
 	if (stats.isFile()) throw new Error(`${path || "/"} is a file. Use repo_read instead.`);
 	if (!stats.isDirectory()) throw new Error(`Not a directory: ${path || "/"}`);
@@ -139,14 +139,10 @@ export async function generateSnapshotTree(snapshotPath: string): Promise<GitHub
 
 export async function createRepoSnapshot(repo: GitHubRepo, commitSha: string, signal?: AbortSignal): Promise<RepoSnapshot> {
 	const cachePath = getRepoSnapshotPath(repo, commitSha);
-	const markerPath = join(cachePath, REPO_CACHE_COMPLETE_MARKER);
-	if (await pathExists(markerPath)) {
+	if (await isCompleteSnapshot(cachePath)) {
 		return { path: cachePath, commit: commitSha };
 	}
 	await mkdir(dirname(cachePath), { recursive: true });
-	if (await pathExists(cachePath)) {
-		await rm(cachePath, { recursive: true, force: true });
-	}
 	const tempDir = await mkdtemp(join(dirname(cachePath), `.tmp-${commitSha}-`));
 	const archivePath = join(tempDir, "repo.tar.gz");
 	const extractPath = join(tempDir, "snapshot");
@@ -154,23 +150,55 @@ export async function createRepoSnapshot(repo: GitHubRepo, commitSha: string, si
 		await mkdir(extractPath, { recursive: true });
 		await downloadRepoArchive(repo, commitSha, archivePath, signal);
 		await execFileAsync("tar", ["-xzf", archivePath, "-C", extractPath, "--strip-components=1"]);
-		await writeFile(join(extractPath, REPO_CACHE_COMPLETE_MARKER), commitSha, "utf8");
-		try {
-			await rename(extractPath, cachePath);
-		} catch (error) {
-			if (await pathExists(markerPath)) {
-				const existingSnapshot = { path: cachePath, commit: commitSha };
-				await getOrCreateSnapshotTree(repo, commitSha, existingSnapshot.path).catch(() => undefined);
-				return existingSnapshot;
-			}
-			throw error;
-		}
+		await writeCompleteMarker(extractPath, commitSha);
+		await publishSnapshot(extractPath, cachePath, tempDir);
 		const snapshot = { path: cachePath, commit: commitSha };
 		await getOrCreateSnapshotTree(repo, commitSha, snapshot.path).catch(() => undefined);
 		return snapshot;
 	} finally {
 		await rm(tempDir, { recursive: true, force: true });
 	}
+}
+
+async function isCompleteSnapshot(cachePath: string): Promise<boolean> {
+	return pathExists(join(cachePath, REPO_CACHE_COMPLETE_MARKER));
+}
+
+// The marker name is reserved by the cache: an archive entry, directory, or symlink must not
+// receive or redirect it, and O_EXCL never follows a symlink.
+async function writeCompleteMarker(extractPath: string, commitSha: string): Promise<void> {
+	const markerPath = join(extractPath, REPO_CACHE_COMPLETE_MARKER);
+	await rm(markerPath, { recursive: true, force: true });
+	await writeFile(markerPath, commitSha, { encoding: "utf8", flag: "wx" });
+}
+
+// Publish only by rename. A shared destination is either a complete snapshot from a concurrent
+// creator (reuse it) or an abandoned incomplete directory (discard it, then retry once).
+async function publishSnapshot(extractPath: string, cachePath: string, tempDir: string): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await rename(extractPath, cachePath);
+			return;
+		} catch (error) {
+			if (await isCompleteSnapshot(cachePath)) return;
+			if (attempt > 0) throw error;
+			await discardIncompleteSnapshot(cachePath, tempDir);
+		}
+	}
+}
+
+async function discardIncompleteSnapshot(cachePath: string, tempDir: string): Promise<void> {
+	const discardedPath = join(tempDir, "discarded");
+	try {
+		await rename(cachePath, discardedPath);
+	} catch {
+		return;
+	}
+	if (await isCompleteSnapshot(discardedPath)) {
+		// A concurrent creator published while we were deciding; put that snapshot back.
+		await rename(discardedPath, cachePath).catch(() => undefined);
+	}
+	await rm(discardedPath, { recursive: true, force: true });
 }
 
 export async function downloadRepoArchive(repo: GitHubRepo, ref: string, archivePath: string, signal?: AbortSignal): Promise<void> {
@@ -185,17 +213,36 @@ export async function downloadRepoArchive(repo: GitHubRepo, ref: string, archive
 }
 
 export async function readSnapshotTextFile(snapshotPath: string, repoPath: string): Promise<string | null> {
-	const absolutePath = resolveSnapshotPath(snapshotPath, repoPath);
+	const absolutePath = await resolveSnapshotPath(snapshotPath, repoPath);
 	const stats = await lstat(absolutePath);
 	if (!stats.isFile()) return null;
 	return await readFile(absolutePath, "utf8");
 }
 
-export function resolveSnapshotPath(snapshotPath: string, repoPath: string): string {
-	const absoluteRoot = resolve(snapshotPath);
-	const absolutePath = resolve(absoluteRoot, ...repoPath.split("/"));
-	if (absolutePath !== absoluteRoot && !absolutePath.startsWith(`${absoluteRoot}${sep}`)) {
-		throw new Error(`Unsafe repository path: ${repoPath}`);
+export class UnsafeRepoPathError extends Error {
+	constructor(repoPath: string) {
+		super(`Unsafe repository path: ${repoPath}`);
+		this.name = "UnsafeRepoPathError";
 	}
-	return absolutePath;
+}
+
+// Rejects tool paths that must never reach filesystem resolution: NUL bytes, Windows
+// drive/UNC forms, and parent traversal. Lexical and canonical containment then pin the
+// result inside the snapshot even through intermediate symlinks.
+export async function resolveSnapshotPath(snapshotPath: string, repoPath: string): Promise<string> {
+	if (hasForbiddenRepoPathForm(repoPath)) throw new UnsafeRepoPathError(repoPath);
+	const absoluteRoot = await realpath(resolve(snapshotPath));
+	const absolutePath = resolve(absoluteRoot, ...repoPath.split("/"));
+	if (!isInsideSnapshot(absoluteRoot, absolutePath)) throw new UnsafeRepoPathError(repoPath);
+	const canonicalPath = await realpath(absolutePath);
+	if (!isInsideSnapshot(absoluteRoot, canonicalPath)) throw new UnsafeRepoPathError(repoPath);
+	return canonicalPath;
+}
+
+function hasForbiddenRepoPathForm(repoPath: string): boolean {
+	return repoPath.includes("\0") || /^([A-Za-z]:[\\/]|\\\\)/.test(repoPath) || repoPath.split("/").includes("..");
+}
+
+function isInsideSnapshot(absoluteRoot: string, candidatePath: string): boolean {
+	return candidatePath === absoluteRoot || candidatePath.startsWith(`${absoluteRoot}${sep}`);
 }

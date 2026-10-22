@@ -1,6 +1,7 @@
-import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
 	DEFAULT_REF_REFRESH_MS,
 	REPO_METADATA_FILE,
@@ -48,10 +49,15 @@ export async function readJsonFile<T>(path: string): Promise<T | null> {
 }
 
 export async function writeJsonFile(path: string, value: unknown): Promise<void> {
-	await mkdir(dirname(path), { recursive: true });
-	const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-	await writeFile(tempPath, `${JSON.stringify(value)}\n`, "utf8");
-	await rename(tempPath, path);
+	const directory = dirname(path);
+	await mkdir(directory, { recursive: true });
+	const tempPath = join(directory, `${basename(path)}.${randomUUID()}.tmp`);
+	try {
+		await writeFile(tempPath, `${JSON.stringify(value)}\n`, { encoding: "utf8", flag: "wx" });
+		await rename(tempPath, path);
+	} finally {
+		await rm(tempPath, { force: true });
+	}
 }
 
 export function getRepoSnapshotPath(repo: GitHubRepo, commitSha: string): string {
