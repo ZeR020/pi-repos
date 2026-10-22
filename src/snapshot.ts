@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { createWriteStream } from "node:fs";
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -25,6 +26,9 @@ import type { CachedRepoState, GitHubRepo, GitHubTreeEntry, GitHubTreeResponse, 
 
 const execFileAsync = promisify(execFile);
 const repoSnapshotCache = new Map<string, Promise<RepoSnapshot>>();
+const SNAPSHOT_LOCK_TIMEOUT_MS = 10_000;
+const SNAPSHOT_LOCK_STALE_MS = 30_000;
+const SNAPSHOT_LOCK_POLL_MS = 25;
 
 export async function getCachedRepoState(repo: GitHubRepo, ref?: string, signal?: AbortSignal): Promise<CachedRepoState | null> {
 	signal?.throwIfAborted();
@@ -161,7 +165,7 @@ export async function createRepoSnapshot(repo: GitHubRepo, commitSha: string, si
 		await downloadRepoArchive(repo, commitSha, archivePath, signal);
 		await execFileAsync("tar", ["-xzf", archivePath, "-C", extractPath, "--strip-components=1"]);
 		await writeCompleteMarker(extractPath, commitSha);
-		await publishSnapshot(extractPath, cachePath, tempDir);
+		await publishSnapshot(extractPath, cachePath, signal);
 		const snapshot = { path: cachePath, commit: commitSha };
 		await getOrCreateSnapshotTree(repo, commitSha, snapshot.path).catch(() => undefined);
 		return snapshot;
@@ -182,33 +186,49 @@ async function writeCompleteMarker(extractPath: string, commitSha: string): Prom
 	await writeFile(markerPath, commitSha, { encoding: "utf8", flag: "wx" });
 }
 
-// Publish only by rename. A shared destination is either a complete snapshot from a concurrent
-// creator (reuse it) or an abandoned incomplete directory (discard it, then retry once).
-async function publishSnapshot(extractPath: string, cachePath: string, tempDir: string): Promise<void> {
-	for (let attempt = 0; ; attempt++) {
-		try {
-			await rename(extractPath, cachePath);
-			return;
-		} catch (error) {
-			if (await isCompleteSnapshot(cachePath)) return;
-			if (attempt > 0) throw error;
-			await discardIncompleteSnapshot(cachePath, tempDir);
-		}
+// Publication and abandoned-directory recovery are serialized across processes by a lock file
+// beside the snapshot. Under the lock the destination is either already complete (reuse it) or
+// incomplete (delete it in place), so a published snapshot is never relocated or removed.
+async function publishSnapshot(extractPath: string, cachePath: string, signal?: AbortSignal): Promise<void> {
+	const lockPath = `${cachePath}.lock`;
+	await acquireSnapshotLock(lockPath, signal);
+	try {
+		if (await isCompleteSnapshot(cachePath)) return;
+		await rm(cachePath, { recursive: true, force: true });
+		await rename(extractPath, cachePath);
+	} finally {
+		await rm(lockPath, { force: true });
 	}
 }
 
-async function discardIncompleteSnapshot(cachePath: string, tempDir: string): Promise<void> {
-	const discardedPath = join(tempDir, "discarded");
+// A holder that dies leaves its lock behind; a lock older than the stale threshold is taken over,
+// so an interrupted creator cannot permanently poison the cache.
+async function acquireSnapshotLock(lockPath: string, signal?: AbortSignal): Promise<void> {
+	const deadline = Date.now() + SNAPSHOT_LOCK_TIMEOUT_MS;
+	for (;;) {
+		signal?.throwIfAborted();
+		try {
+			await writeFile(lockPath, String(process.pid), { encoding: "utf8", flag: "wx" });
+			return;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
+		if (await isStaleSnapshotLock(lockPath)) {
+			await rm(lockPath, { force: true });
+			continue;
+		}
+		if (Date.now() >= deadline) throw new Error(`Timed out waiting for the snapshot publication lock: ${lockPath}`);
+		await delay(SNAPSHOT_LOCK_POLL_MS, undefined, { signal });
+	}
+}
+
+async function isStaleSnapshotLock(lockPath: string): Promise<boolean> {
 	try {
-		await rename(cachePath, discardedPath);
+		const stats = await stat(lockPath);
+		return Date.now() - stats.mtimeMs > SNAPSHOT_LOCK_STALE_MS;
 	} catch {
-		return;
+		return false;
 	}
-	if (await isCompleteSnapshot(discardedPath)) {
-		// A concurrent creator published while we were deciding; put that snapshot back.
-		await rename(discardedPath, cachePath).catch(() => undefined);
-	}
-	await rm(discardedPath, { recursive: true, force: true });
 }
 
 export async function downloadRepoArchive(repo: GitHubRepo, ref: string, archivePath: string, signal?: AbortSignal): Promise<void> {

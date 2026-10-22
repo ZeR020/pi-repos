@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import fsp from "node:fs/promises";
-import { mkdir, mkdtemp, readdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -219,7 +219,24 @@ test("a creator that loses the publication race reuses the concurrent snapshot",
 	}
 });
 
-test("an abandoned incomplete snapshot directory does not block creation", async () => {
+type RenameHook = (from: string, to: string) => Promise<boolean>;
+
+// Lets a test observe or act on production renames; the hook returns true when it handled the call.
+function patchRename(hook: RenameHook): () => void {
+	const mutableFs = fsp as unknown as { rename: typeof fsp.rename };
+	const realRename = mutableFs.rename;
+	mutableFs.rename = async function rename(from, to) {
+		if (await hook(String(from), String(to))) return;
+		return realRename(from, to);
+	} as typeof fsp.rename;
+	syncBuiltinESMExports();
+	return () => {
+		mutableFs.rename = realRename;
+		syncBuiltinESMExports();
+	};
+}
+
+test("an abandoned incomplete snapshot directory is recovered without relocating the snapshot path", async () => {
 	const root = await makeCacheDir();
 	const repo = { owner: "fixture", name: "abandoned" };
 	const snapshotPath = getRepoSnapshotPath(repo, commit);
@@ -228,15 +245,99 @@ test("an abandoned incomplete snapshot directory does not block creation", async
 	const archive = await buildArchive(root, "fresh", { "fresh.txt": "FRESH" });
 	globalThis.fetch = async () => new Response(archive);
 
+	const relocations: string[] = [];
+	const restoreRename = patchRename(async (from, to) => {
+		if (from === snapshotPath) relocations.push(to);
+		return false;
+	});
+	try {
+		const snapshot = await createRepoSnapshot(repo, commit);
+
+		assert.deepEqual(relocations, []);
+		assert.equal(await readFile(join(snapshot.path, REPO_CACHE_COMPLETE_MARKER), "utf8"), commit);
+		assert.equal(await readFile(join(snapshot.path, "fresh.txt"), "utf8"), "FRESH");
+		assert.equal(await pathExists(join(snapshot.path, "partial.txt")), false);
+		assert.deepEqual((await readdir(dirname(snapshotPath))).filter(name => name.endsWith(".lock")), []);
+	} finally {
+		restoreRename();
+	}
+});
+
+test("a snapshot published during recovery is neither relocated nor made unreadable", async () => {
+	const root = await makeCacheDir();
+	const repo = { owner: "fixture", name: "recovery-interleave" };
+	const snapshotPath = getRepoSnapshotPath(repo, commit);
+	const markerPath = join(snapshotPath, REPO_CACHE_COMPLETE_MARKER);
+	await mkdir(snapshotPath, { recursive: true });
+	await writeFile(join(snapshotPath, "partial.txt"), "PARTIAL", "utf8");
+	const archive = await buildArchive(root, "recover", { "ours.txt": "OURS" });
+	globalThis.fetch = async () => new Response(archive);
+
+	// Another creator publishes a complete snapshot after our marker check and before recovery.
+	const relocations: string[] = [];
+	const readability: boolean[] = [];
+	const restoreRename = patchRename(async (from, to) => {
+		if (from !== snapshotPath) return false;
+		relocations.push(to);
+		await rm(snapshotPath, { recursive: true, force: true });
+		await mkdir(snapshotPath, { recursive: true });
+		await writeFile(join(snapshotPath, "winner.txt"), "WINNER", "utf8");
+		await writeFile(markerPath, commit, "utf8");
+		readability.push(await pathExists(markerPath));
+		await fsp.rename(from, to);
+		readability.push(await pathExists(markerPath));
+		return true;
+	});
+	try {
+		const snapshot = await createRepoSnapshot(repo, commit);
+
+		assert.deepEqual(relocations, []);
+		assert.deepEqual(readability.filter(readable => !readable), []);
+		assert.equal(await readFile(join(snapshot.path, REPO_CACHE_COMPLETE_MARKER), "utf8"), commit);
+	} finally {
+		restoreRename();
+	}
+});
+
+test("an abandoned publication lock does not poison the cache", async () => {
+	const root = await makeCacheDir();
+	const repo = { owner: "fixture", name: "stale-lock" };
+	const snapshotPath = getRepoSnapshotPath(repo, commit);
+	const lockPath = `${snapshotPath}.lock`;
+	await mkdir(dirname(snapshotPath), { recursive: true });
+	await writeFile(lockPath, "interrupted-creator", "utf8");
+	const past = new Date(Date.now() - 120_000);
+	await fsp.utimes(lockPath, past, past);
+	const archive = await buildArchive(root, "stale", { "fresh.txt": "FRESH" });
+	globalThis.fetch = async () => new Response(archive);
+
 	const snapshot = await createRepoSnapshot(repo, commit);
 
 	assert.equal(await readFile(join(snapshot.path, REPO_CACHE_COMPLETE_MARKER), "utf8"), commit);
 	assert.equal(await readFile(join(snapshot.path, "fresh.txt"), "utf8"), "FRESH");
-	assert.equal(await pathExists(join(snapshot.path, "partial.txt")), false);
+	assert.equal(await pathExists(lockPath), false);
+});
+
+test("an aborted publication wait leaves another creator's lock in place", async () => {
+	const root = await makeCacheDir();
+	const repo = { owner: "fixture", name: "aborted-lock" };
+	const snapshotPath = getRepoSnapshotPath(repo, commit);
+	const lockPath = `${snapshotPath}.lock`;
+	await mkdir(dirname(snapshotPath), { recursive: true });
+	await writeFile(lockPath, "live-creator", "utf8");
+	const archive = await buildArchive(root, "aborted", { "fresh.txt": "FRESH" });
+	globalThis.fetch = async () => new Response(archive);
+	const controller = new AbortController();
+	controller.abort();
+
+	await assert.rejects(createRepoSnapshot(repo, commit, controller.signal), (error: Error) => error.name === "AbortError");
+
+	assert.equal(await readFile(lockPath, "utf8"), "live-creator");
+	assert.equal(await pathExists(snapshotPath), false);
 });
 
 test("staging directories are cleaned up after a failed download", async () => {
-	const root = await makeCacheDir();
+	await makeCacheDir();
 	const repo = { owner: "fixture", name: "failed-download" };
 	globalThis.fetch = async () => new Response("offline fixture interruption", { status: 503 });
 
