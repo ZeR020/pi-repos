@@ -73,6 +73,12 @@ test("release verification covers every Node leg and the packaged contents", () 
 	}
 });
 
+test("release explicitly opts out of automatic package-manager caching", () => {
+	const setup = readWorkflow("release.yml").jobs.verify.steps.find(step => step.uses?.startsWith("actions/setup-node@"));
+	assert.equal(setup?.with?.["package-manager-cache"], false);
+	assert.equal(setup?.with?.cache, undefined);
+});
+
 test("publishing waits for every verify leg and uploads from one leg", () => {
 	const release = readWorkflow("release.yml");
 	const verify = release.jobs.verify;
