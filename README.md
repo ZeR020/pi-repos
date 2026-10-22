@@ -101,7 +101,7 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-`.github/workflows/release.yml` then checks that the tag equals `v` plus the package version, that the tagged commit is reachable from `main`, and that typecheck, tests, and the dependency audit pass. On success the release job, which is the only job granted write access, creates the GitHub release from the `npm pack` tarball and a `SHA256SUMS` checksum file.
+`.github/workflows/release.yml` then checks that the tag equals `v` plus the package version and that the tagged commit is reachable from `main`, and runs typecheck, tests, the dependency audit, and the packaged-file validation on both Node 22 and Node 24. The release job only runs after every verification leg succeeds; as the only job granted write access, it then creates the GitHub release from the `npm pack` tarball and a `SHA256SUMS` checksum file.
 
 ## Notes
 

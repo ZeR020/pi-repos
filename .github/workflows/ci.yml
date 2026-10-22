@@ -28,7 +28,8 @@ jobs:
           persist-credentials: false
 
       - name: Set up Node
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        # v7.1.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -56,20 +57,5 @@ jobs:
 
       - name: Validate packaged files
         run: |
-          npm pack --dry-run --ignore-scripts --json > pack.json
-          node --input-type=module -e '
-            import { readFileSync } from "node:fs";
-            const [manifest] = JSON.parse(readFileSync("pack.json", "utf8"));
-            const files = manifest.files.map((file) => file.path);
-            const required = ["src/index.ts", "README.md", "LICENSE"];
-            const forbidden = files.filter((file) =>
-              /^(node_modules|test|\.github)\//.test(file));
-            const missing = required.filter((file) => !files.includes(file));
-            if (missing.length || forbidden.length) {
-              console.error(
-                `invalid packaged files: missing=${missing} forbidden=${forbidden}`,
-              );
-              process.exit(1);
-            }
-            console.log(`${files.length} packaged files validated`);
-          '
+          npm pack --dry-run --ignore-scripts --json > "$RUNNER_TEMP/pack.json"
+          node scripts/check-pack-contents.mjs "$RUNNER_TEMP/pack.json"
