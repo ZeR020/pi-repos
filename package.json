@@ -1,0 +1,65 @@
+{
+  "name": "pi-repos",
+  "version": "0.2.0",
+  "description": "Read and search GitHub repositories as if local in Pi: find repos, code examples, files, and grep cached archives.",
+  "author": "ZeR020",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZeR020/pi-repos.git"
+  },
+  "homepage": "https://github.com/ZeR020/pi-repos#readme",
+  "bugs": {
+    "url": "https://github.com/ZeR020/pi-repos/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "github",
+    "repositories",
+    "code-search"
+  ],
+  "files": [
+    "src/**/*.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-tui": "^0.74.0",
+    "@types/node": "^22.0.0",
+    "typebox": "^1.1.24",
+    "typescript": "^5.8.0"
+  }
+}

@@ -1,0 +1,14 @@
+export const GITHUB_API_URL = "https://api.github.com";
+export const GITHUB_API_VERSION = "2022-11-28";
+export const DEFAULT_LIST_LIMIT = 500;
+export const DEFAULT_FIND_LIMIT = 1000;
+export const DEFAULT_GREP_LIMIT = 100;
+export const DEFAULT_REPO_READ_LIMIT = 200;
+export const GREP_MAX_LINE_LENGTH = 500;
+export const RIPGREP_CHUNK_SIZE = 500;
+export const RIPGREP_MAX_ARG_BYTES = 96 * 1024;
+export const REPO_CACHE_COMPLETE_MARKER = ".pi-repos-complete";
+export const REPO_METADATA_FILE = ".pi-repos-repo.json";
+export const REPO_REFS_DIR = ".pi-repos-refs";
+export const REPO_TREES_DIR = ".pi-repos-trees";
+export const DEFAULT_REF_REFRESH_MS = 5 * 60 * 1000;
