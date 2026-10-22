@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Node ${{ matrix.node }} checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Verify archive and search tools
+        run: |
+          if ! tar --version | head -n 1 | grep -q "GNU tar"; then
+            echo "::error::GNU tar is required for archive extraction"
+            exit 1
+          fi
+          if ! command -v rg > /dev/null; then
+            echo "::notice::ripgrep missing; installing in this runner"
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends ripgrep
+          fi
+          rg --version | head -n 1
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck and test
+        run: npm run check
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Validate packaged files
+        run: |
+          npm pack --dry-run --ignore-scripts --json > pack.json
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const [manifest] = JSON.parse(readFileSync("pack.json", "utf8"));
+            const files = manifest.files.map((file) => file.path);
+            const required = ["src/index.ts", "README.md", "LICENSE"];
+            const forbidden = files.filter((file) =>
+              /^(node_modules|test|\.github)\//.test(file));
+            const missing = required.filter((file) => !files.includes(file));
+            if (missing.length || forbidden.length) {
+              console.error(
+                `invalid packaged files: missing=${missing} forbidden=${forbidden}`,
+              );
+              process.exit(1);
+            }
+            console.log(`${files.length} packaged files validated`);
+          '
