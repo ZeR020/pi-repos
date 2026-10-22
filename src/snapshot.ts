@@ -155,6 +155,7 @@ export async function generateSnapshotTree(snapshotPath: string, signal?: AbortS
 }
 
 export async function createRepoSnapshot(repo: GitHubRepo, commitSha: string, signal?: AbortSignal): Promise<RepoSnapshot> {
+	signal?.throwIfAborted();
 	const cachePath = getRepoSnapshotPath(repo, commitSha);
 	const publishedPath = await findCompleteSnapshotPath(commitSha, cachePath);
 	if (publishedPath) return { path: publishedPath, commit: commitSha };
@@ -165,10 +166,13 @@ export async function createRepoSnapshot(repo: GitHubRepo, commitSha: string, si
 	try {
 		await mkdir(extractPath, { recursive: true });
 		await downloadRepoArchive(repo, commitSha, archivePath, signal);
-		await execFileAsync("tar", ["-xzf", archivePath, "-C", extractPath, "--strip-components=1"]);
+		await execFileAsync("tar", ["-xzf", archivePath, "-C", extractPath, "--strip-components=1"], { signal });
+		signal?.throwIfAborted();
 		await writeCompleteMarker(extractPath, commitSha);
 		const snapshot = await publishSnapshot(commitSha, extractPath, cachePath);
-		await getOrCreateSnapshotTree(repo, commitSha, snapshot.path).catch(() => undefined);
+		await getOrCreateSnapshotTree(repo, commitSha, snapshot.path, signal).catch(error => {
+			if (signal?.aborted) throw error;
+		});
 		return snapshot;
 	} finally {
 		await rm(tempDir, { recursive: true, force: true });
@@ -228,7 +232,7 @@ export async function downloadRepoArchive(repo: GitHubRepo, ref: string, archive
 		signal,
 	);
 	if (!response.body) throw new Error("GitHub archive response had no body.");
-	await pipeline(Readable.fromWeb(response.body as never), createWriteStream(archivePath));
+	await pipeline(Readable.fromWeb(response.body as never), createWriteStream(archivePath), { signal });
 }
 
 export async function readSnapshotTextFile(snapshotPath: string, repoPath: string): Promise<string | null> {

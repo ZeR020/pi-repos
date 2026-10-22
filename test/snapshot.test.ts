@@ -460,6 +460,7 @@ test("an aborted download publishes no generation", async () => {
 	await makeCacheDir();
 	const repo = { owner: "fixture", name: "aborted-download" };
 	const cachePath = getRepoSnapshotPath(repo, commit);
+	await mkdir(dirname(cachePath), { recursive: true });
 	globalThis.fetch = async (_input, init) => {
 		init?.signal?.throwIfAborted();
 		return new Response("unexpected body");
