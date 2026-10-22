@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -237,6 +237,8 @@ test("repository identifiers reject unsafe owner and name segments", () => {
 	}
 	assert.throws(() => parseRepoInput("https://github.com/../.."), /Invalid GitHub repository URL/);
 	assert.throws(() => parseRepoInput("https://github.com/owner/%zz"), /Invalid GitHub repository URL/);
+	assert.throws(() => parseRepoInput("https://"), /Invalid GitHub repository URL/);
+	assert.throws(() => parseRepoInput("https://github.com:bad/owner"), /Invalid GitHub repository URL/);
 	assert.deepEqual(parseRepoInput("owner/name"), { owner: "owner", name: "name" });
 	assert.deepEqual(parseRepoInput("owner/name.git"), { owner: "owner", name: "name" });
 	assert.deepEqual(parseRepoInput("https://github.com/owner/name.git"), { owner: "owner", name: "name" });
@@ -295,5 +297,47 @@ test("empty files return empty text without another request", async () => {
 		assert.equal(transport.calls.length, 1);
 	} finally {
 		transport.restore();
+	}
+});
+
+test("a cancelled caller stops waiting for shared token discovery", async () => {
+	const stubDirectory = await mkdtemp(join(tmpdir(), "pi-repos-gh-"));
+	const releasePath = join(stubDirectory, "release");
+	const tokenVariables = ["GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT", "GITHUB_PERSONAL_ACCESS_TOKEN"];
+	const previousTokens = tokenVariables.map(name => [name, process.env[name]] as const);
+	const previousPath = process.env.PATH;
+	// Bounded stub: discovery stays pending until the release file exists or roughly 4s pass.
+	await writeFile(
+		join(stubDirectory, "gh"),
+		`#!/bin/sh\ni=0\nwhile [ ! -f "${releasePath}" ] && [ "$i" -lt 400 ]; do sleep 0.01; i=$((i + 1)); done\necho stub-token\n`,
+		{ mode: 0o755 },
+	);
+	const transport = stubResponses(jsonResponse(metadataBody));
+	const cancelled = new AbortController();
+	const kept = new AbortController();
+	try {
+		for (const name of tokenVariables) delete process.env[name];
+		process.env.PATH = `${stubDirectory}:${previousPath ?? ""}`;
+		const cancelledLookup = getRepoMetadata(repo("metadata-token-discovery"), cancelled.signal);
+		const keptLookup = getRepoMetadata(repo("metadata-token-discovery"), kept.signal);
+		await new Promise(resolve => setImmediate(resolve));
+		cancelled.abort();
+		await assert.rejects(
+			withinDeadline(cancelledLookup, "cancelled token waiter"),
+			isAbortError,
+			"a cancelled caller must not wait for token discovery",
+		);
+		assert.equal(transport.calls.length, 0);
+		await writeFile(releasePath, "", "utf8");
+		assert.deepEqual(await withinDeadline(keptLookup, "shared token waiter"), metadataBody);
+		assert.equal(transport.calls.length, 1);
+	} finally {
+		for (const [name, value] of previousTokens) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+		process.env.PATH = previousPath;
+		transport.restore();
+		await rm(stubDirectory, { recursive: true, force: true });
 	}
 });

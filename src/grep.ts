@@ -189,6 +189,18 @@ async function yieldScanProgress(signal?: AbortSignal): Promise<void> {
 	throwIfAborted(signal);
 }
 
+// Missing, dangling, and escaping entries are skipped; access and I/O failures must reach the
+// caller so it can fall back to REST instead of reporting a completed negative search.
+const SKIPPED_SNAPSHOT_ENTRY_CODES = new Set(["ENOENT", "ENOTDIR", "ELOOP"]);
+
+function isSkippableSnapshotEntryError(error: unknown): boolean {
+	if (error instanceof Error && (error.name === "UnsafeRepoPathError" || error.message.startsWith("Unsafe repository path: "))) {
+		return true;
+	}
+	const code = (error as NodeJS.ErrnoException | undefined)?.code;
+	return typeof code === "string" && SKIPPED_SNAPSHOT_ENTRY_CODES.has(code);
+}
+
 async function selectScannableTargets(cwd: string, targets: string[], signal?: AbortSignal): Promise<string[]> {
 	const scannableTargets: string[] = [];
 	for (const target of targets) {
@@ -197,8 +209,8 @@ async function selectScannableTargets(cwd: string, targets: string[], signal?: A
 			// Awaited so the check keeps working when resolveSnapshotPath becomes async.
 			const stats = await lstat(await resolveSnapshotPath(cwd, target));
 			if (stats.isFile() || stats.isDirectory()) scannableTargets.push(target);
-		} catch {
-			// Skip missing, dangling, or escaping entries; one bad entry must not abort the scan.
+		} catch (error) {
+			if (!isSkippableSnapshotEntryError(error)) throw error;
 		}
 	}
 	return scannableTargets;
@@ -211,8 +223,8 @@ async function readScannableSnapshotTextFile(snapshotPath: string, filePath: str
 		const stats = await lstat(await resolveSnapshotPath(snapshotPath, filePath));
 		if (!stats.isFile()) return null;
 		return await readSnapshotTextFile(snapshotPath, filePath);
-	} catch {
-		// Skip missing, dangling, symlinked, or escaping entries; one bad entry must not abort the scan.
+	} catch (error) {
+		if (!isSkippableSnapshotEntryError(error)) throw error;
 		return null;
 	}
 }

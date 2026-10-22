@@ -43,6 +43,15 @@ function cachePromise<T>(cache: Map<string, Promise<T>>, key: string, create: ()
 	return pending;
 }
 
+// Caller-local cancellation for shared work: the awaited promise keeps running, only this wait stops.
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const abortHandler = () => reject(signal.reason);
+		signal.addEventListener("abort", abortHandler, { once: true });
+		void promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abortHandler));
+	});
+}
+
 export async function githubFetch(
 	path: string,
 	accept = "application/vnd.github+json",
@@ -50,7 +59,9 @@ export async function githubFetch(
 	signal?: AbortSignal,
 ): Promise<Response> {
 	throwIfAborted(signal);
-	const token = explicitToken ?? (await getGitHubToken());
+	const token = explicitToken ?? (signal ? await raceWithAbort(getGitHubToken(), signal) : await getGitHubToken());
+	// The signal may have aborted while token discovery was pending.
+	throwIfAborted(signal);
 	const headers: Record<string, string> = {
 		Accept: accept,
 		"X-GitHub-Api-Version": GITHUB_API_VERSION,
@@ -146,7 +157,12 @@ export function parseRepoLocatorInput(input: string): GitHubRepoLocator {
 	const trimmed = input.trim();
 	if (!trimmed) throw new Error("Repository is required.");
 	if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
-		const url = new URL(trimmed);
+		let url: URL;
+		try {
+			url = new URL(trimmed);
+		} catch {
+			throw new Error(`Invalid GitHub repository URL: ${input}`);
+		}
 		if (url.hostname !== "github.com") {
 			throw new Error(`Unsupported repository host: ${url.hostname}`);
 		}

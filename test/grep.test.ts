@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -200,6 +200,43 @@ test("JavaScript scan and output skip missing entries next to valid files", asyn
 		assert.match(formatted.output, /a\.txt:1: match/);
 		assert.doesNotMatch(formatted.output, /missing/);
 	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("snapshot scans reject unreadable entries instead of reporting no matches", async t => {
+	if (process.geteuid?.() === 0) {
+		t.skip("permission injection needs a non-root test user");
+		return;
+	}
+	const directory = await createSnapshotFile({ "a.txt": "match\n", "secret.txt": "match\n" });
+	const blockedDirectory = join(directory, "blocked");
+	await mkdir(blockedDirectory);
+	await writeFile(join(blockedDirectory, "inner.txt"), "match\n", "utf8");
+	try {
+		await chmod(join(directory, "secret.txt"), 0o000);
+		await chmod(blockedDirectory, 0o000);
+		const snapshot = { path: directory, commit: "0".repeat(40) };
+		await assert.rejects(
+			grepSnapshotWithJavaScript(snapshot, { repo: "fixture/eacces", pattern: "match" }, ["a.txt", "secret.txt"], 10),
+			/EACCES/,
+			"an unreadable file must not become a completed negative scan",
+		);
+		await assert.rejects(
+			formatSnapshotGrepOutput(directory, [{ filePath: "secret.txt", lineNumber: 1 }], directoryTarget, 0),
+			/EACCES/,
+			"an unreadable match must not format as empty output",
+		);
+		await assert.rejects(
+			runRipgrepChunk(directory, { repo: "fixture/eacces", pattern: "match" }, ["blocked/inner.txt"], new Set(["blocked/inner.txt"]), 10),
+			/EACCES/,
+			"an unreadable rg target must not be skipped",
+		);
+		const absent = await runRipgrepChunk(directory, { repo: "fixture/eacces", pattern: "match" }, ["missing/inner.txt"], new Set(["missing/inner.txt"]), 10);
+		assert.deepEqual(absent, { matches: [], matchLimitReached: false });
+	} finally {
+		await chmod(blockedDirectory, 0o700);
+		await chmod(join(directory, "secret.txt"), 0o600);
 		await rm(directory, { recursive: true, force: true });
 	}
 });
